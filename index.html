@@ -670,7 +670,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
 
 <div class="upload-panel">
   <div class="up-title">Update dataset</div>
-  <div class="up-desc">Upload the latest faculty-wise export (.xlsx or .csv) each time new data is available.</div>
+  <div class="up-desc">Upload the latest faculty-wise export (.xlsx or .csv). Also works with a per-student course list (Register Number, Course code, Faculty Code, etc.) — it'll pick up names/sections from it too if present.</div>
   <input type="file" id="up-file" accept=".xlsx,.xls,.csv">
   <select id="up-mode">
     <option value="append">Add to existing data (skip duplicates)</option>
@@ -850,18 +850,24 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     if(!sheetRows.length) return {records:[], errors:['That file has no data rows.']};
     const sample = sheetRows[0];
     const yearKey = findKey(sample, ['year']);
-    const subjKey = findKey(sample, ['subjectcode','subject']);
-    const facKey = findKey(sample, ['facultyid','fcaultyid','faculty']);
+    const subjKey = findKey(sample, ['subjectcode','subject','coursecode','course']);
+    const facKey = findKey(sample, ['facultyid','fcaultyid','faculty','facultycode']);
     const regKey = findKey(sample, ['registerno','regno','registernumber']);
+    // optional bonus columns — enrich student/faculty names in the same pass if present
+    const nameKey = findKey(sample, ['studentname','name','fullname']);
+    const secKey = findKey(sample, ['section','batch','sectionbatch','class']);
+    const facNameKey = findKey(sample, ['facultyname']);
     const missing = [];
     if(!yearKey) missing.push('Year');
-    if(!subjKey) missing.push('SubjectCode');
-    if(!facKey) missing.push('FacultyID');
-    if(!regKey) missing.push('Registerno');
-    if(missing.length) return {records:[], errors:[`Couldn't find column(s): ${missing.join(', ')}. Expected headers like Year, SubjectCode, FacultyID, Registerno.`]};
+    if(!subjKey) missing.push('SubjectCode / Course code');
+    if(!facKey) missing.push('FacultyID / Faculty Code');
+    if(!regKey) missing.push('Registerno / Register Number');
+    if(missing.length) return {records:[], errors:[`Couldn't find column(s): ${missing.join(', ')}. Expected headers like Year, SubjectCode (or Course code), FacultyID (or Faculty Code), Registerno (or Register Number).`]};
 
     const records = [];
     const unmapped = new Set();
+    const studentUpdates = new Map();
+    const facultyNameUpdates = new Map();
     sheetRows.forEach(row=>{
       const yearVal = parseInt(row[yearKey], 10);
       const subjVal = String(row[subjKey]||'').trim();
@@ -869,8 +875,19 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
       const facRaw = row[facKey];
       const facList = (facRaw===undefined||facRaw===null||String(facRaw).trim()==='')
         ? ['(Unassigned)']
-        : String(facRaw).split(',').map(s=>s.trim()).filter(Boolean);
+        : String(facRaw).replace(/\.0+$/,'').split(',').map(s=>s.trim().replace(/\.0+$/,'')).filter(Boolean);
       const regList = String(row[regKey]||'').split(',').map(s=>s.trim()).filter(Boolean);
+      if(nameKey || secKey){
+        regList.forEach(reg=>{
+          const nm = nameKey ? String(row[nameKey]||'').trim() : '';
+          const sec = secKey ? String(row[secKey]||'').trim() : '';
+          if(nm || sec) studentUpdates.set(reg, {name:nm, section:sec});
+        });
+      }
+      if(facNameKey){
+        const fnm = String(row[facNameKey]||'').trim();
+        if(fnm) facList.forEach(fac=>facultyNameUpdates.set(fac, fnm));
+      }
       facList.forEach(fac=>{
         regList.forEach(reg=>{
           let dept = 'UNMAPPED';
@@ -885,7 +902,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
         });
       });
     });
-    return {records, errors:[], unmapped:Array.from(unmapped)};
+    return {records, errors:[], unmapped:Array.from(unmapped), studentUpdates, facultyNameUpdates};
   }
 
   function showNotice(msg, type){
@@ -914,7 +931,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
           : XLSX.read(new Uint8Array(evt.target.result), {type:'array'});
         const sheetName = wb.SheetNames[0];
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], {defval:'', raw:false});
-        const {records:newRecords, errors, unmapped} = transformSheetRows(rows);
+        const {records:newRecords, errors, unmapped, studentUpdates, facultyNameUpdates} = transformSheetRows(rows);
         if(errors.length){ showNotice(errors.join(' '), 'error'); statusEl.textContent=''; e.target.value=''; return; }
 
         let addedCount=0, skippedCount=0;
@@ -930,17 +947,29 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
           });
         }
         rebuildRAWFromRecords();
-        populate(selYear, RAW.years.map(String));
-        populate(selDept, RAW.depts);
-        populate(selFac, RAW.faculties, facultyLabel);
-        populate(selSubj, RAW.subjects);
+        refreshDropdownOptions();
         state.year=ALL; state.dept=ALL; state.fac=ALL; state.subj=ALL; state.page=0;
         syncSelectsFromState();
+
+        // bonus: this file also had Student Name/Section and/or Faculty Name columns — use them
+        let bonusBits = [];
+        if(studentUpdates && studentUpdates.size){
+          studentUpdates.forEach((v,k)=>{
+            const existing = STUDENT_INFO.get(k) || {};
+            STUDENT_INFO.set(k, { name: v.name || existing.name || '', section: v.section || existing.section || '' });
+          });
+          bonusBits.push(`${studentUpdates.size.toLocaleString('en-IN')} student name/section detail${studentUpdates.size===1?'':'s'}`);
+        }
+        if(facultyNameUpdates && facultyNameUpdates.size){
+          facultyNameUpdates.forEach((v,k)=>{ FACULTY_NAMES[k] = v; });
+          bonusBits.push(`${facultyNameUpdates.size.toLocaleString('en-IN')} faculty name${facultyNameUpdates.size===1?'':'s'}`);
+        }
         render();
 
         let msg = mode==='replace'
           ? `Replaced dataset — ${addedCount.toLocaleString('en-IN')} enrollment rows loaded from "${file.name}".`
           : `Added ${addedCount.toLocaleString('en-IN')} new enrollment row${addedCount===1?'':'s'} from "${file.name}"${skippedCount? ` (skipped ${skippedCount.toLocaleString('en-IN')} exact duplicates)`:''}. Total now ${RAW.r.length.toLocaleString('en-IN')}.`;
+        if(bonusBits.length) msg += ` Also picked up ${bonusBits.join(' and ')} from the same file.`;
         statusEl.textContent = msg;
         if(unmapped && unmapped.length){
           showNotice(`${msg} Note: ${unmapped.length} unrecognised department code(s) found (${unmapped.slice(0,6).join(', ')}${unmapped.length>6?'…':''}) — labelled "UNMAPPED".`, 'warn');
@@ -1021,10 +1050,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   const selSubj = document.getElementById('f-subj');
   const inpSearch = document.getElementById('f-search');
 
-  populate(selYear, RAW.years.map(String));
-  populate(selDept, RAW.depts);
-  populate(selFac, RAW.faculties, facultyLabel);
-  populate(selSubj, RAW.subjects);
+  refreshDropdownOptions();
 
   document.getElementById('fac-hint').textContent = `top ${TOP_N} shown`;
   document.getElementById('subj-hint').textContent = `top ${TOP_N} shown`;
@@ -1046,6 +1072,31 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     const out = [];
     for(let i=0;i<N;i++){ if(rowMatches(i,{})) out.push(i); }
     return out;
+  }
+
+  // Cascading dropdowns: each select only lists options that actually occur given
+  // the OTHER three filters (e.g. pick a Faculty -> Subject list narrows to their courses).
+  // A dropdown never filters against its own current value, so whatever's already
+  // selected always stays selectable.
+  function refreshDropdownOptions(){
+    const validYears = new Set(), validDepts = new Set(), validFacs = new Set(), validSubjs = new Set();
+    for(let i=0;i<N;i++){
+      if(rowMatches(i,{excl:'year'})) validYears.add(RAW.years[RAW.y[i]]);
+      if(rowMatches(i,{excl:'dept'})) validDepts.add(RAW.depts[RAW.d[i]]);
+      if(rowMatches(i,{excl:'fac'}))  validFacs.add(RAW.faculties[RAW.f[i]]);
+      if(rowMatches(i,{excl:'subj'})) validSubjs.add(RAW.subjects[RAW.s[i]]);
+    }
+    // if a currently-selected value would vanish under the new options, clear it
+    if(state.year!==ALL && !validYears.has(Number(state.year))) state.year = ALL;
+    if(state.dept!==ALL && !validDepts.has(state.dept)) state.dept = ALL;
+    if(state.fac!==ALL && !validFacs.has(state.fac)) state.fac = ALL;
+    if(state.subj!==ALL && !validSubjs.has(state.subj)) state.subj = ALL;
+
+    populate(selYear, RAW.years.filter(y=>validYears.has(y)).map(String));
+    populate(selDept, RAW.depts.filter(d=>validDepts.has(d)));
+    populate(selFac, RAW.faculties.filter(f=>validFacs.has(f)), facultyLabel);
+    populate(selSubj, RAW.subjects.filter(s=>validSubjs.has(s)));
+    syncSelectsFromState();
   }
 
   function computeGroupCounts(dim, exclDim){
@@ -1105,7 +1156,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     const cur = state[dim];
     state[dim] = (cur===value) ? ALL : value; // click active bar again to clear
     state.page = 0;
-    syncSelectsFromState();
+    refreshDropdownOptions();
     render();
   }
 
@@ -1206,7 +1257,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
         state.year = (state.year===y) ? ALL : y;
         state.dept = (state.dept===d) ? ALL : d;
         state.page = 0;
-        syncSelectsFromState();
+        refreshDropdownOptions();
         render();
       });
     });
@@ -1289,13 +1340,23 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   }
   // "Course code - Faculty code" when both a specific Subject and Faculty are picked;
   // otherwise fall back to a name that reflects whichever filters are active.
-  function exportBaseName(){
-    if(state.subj!==ALL && state.fac!==ALL){
-      return `${safeFileToken(state.subj)}-${safeFileToken(state.fac)}`;
-    }
+  // Builds a filename from whichever filters are active. Faculty always gets its name
+  // appended (when known). If Subject isn't explicitly filtered but every row in the
+  // current export happens to share one subject anyway, that course code is still used —
+  // covers the common case of filtering by Faculty (+ Year/Dept) for a single course.
+  function exportBaseName(filtered){
     const bits = [];
-    if(state.subj!==ALL) bits.push(safeFileToken(state.subj));
-    if(state.fac!==ALL) bits.push(safeFileToken(state.fac));
+    let subjCode = state.subj!==ALL ? state.subj : null;
+    if(!subjCode && filtered && filtered.length){
+      const uniqueSubj = new Set(filtered.map(i=>RAW.s[i]));
+      if(uniqueSubj.size===1) subjCode = RAW.subjects[[...uniqueSubj][0]];
+    }
+    if(subjCode) bits.push(safeFileToken(subjCode));
+    if(state.fac!==ALL){
+      bits.push(safeFileToken(state.fac));
+      const nm = FACULTY_NAMES[state.fac];
+      if(nm) bits.push(safeFileToken(nm));
+    }
     if(state.dept!==ALL) bits.push(safeFileToken(state.dept));
     if(state.year!==ALL) bits.push(safeFileToken(state.year));
     return bits.length ? bits.join('-') : 'kgisl_enrollment_report';
@@ -1324,7 +1385,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     lines.push('');
     lines.push(`Faculty Signature: ______________________          Date: ______________`);
     const blob = new Blob([lines.join('\n')], {type:'text/csv'});
-    downloadBlob(blob, `${exportBaseName()}.csv`);
+    downloadBlob(blob, `${exportBaseName(filtered)}.csv`);
   }
 
   function exportXLSX(filtered){
@@ -1350,7 +1411,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     ws['!rows'] = aoa.map((_,r)=> r<=4 ? {hpt:16} : undefined);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Enrollment Report');
-    XLSX.writeFile(wb, `${exportBaseName()}.xlsx`);
+    XLSX.writeFile(wb, `${exportBaseName(filtered)}.xlsx`);
   }
 
   function exportPDF(filtered){
@@ -1411,7 +1472,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
       doc.text(`${p} of ${totalPages}`, pageWidth-margin, doc.internal.pageSize.getHeight()-16, {align:'right'});
     }
 
-    doc.save(`${exportBaseName()}.pdf`);
+    doc.save(`${exportBaseName(filtered)}.pdf`);
   }
 
   function downloadBlob(blob, filename){
@@ -1423,10 +1484,10 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   }
 
   // ---------- events ----------
-  selYear.addEventListener('change', ()=>{ state.year=selYear.value; state.page=0; render(); });
-  selDept.addEventListener('change', ()=>{ state.dept=selDept.value; state.page=0; render(); });
-  selFac.addEventListener('change', ()=>{ state.fac=selFac.value; state.page=0; render(); });
-  selSubj.addEventListener('change', ()=>{ state.subj=selSubj.value; state.page=0; render(); });
+  selYear.addEventListener('change', ()=>{ state.year=selYear.value; state.page=0; refreshDropdownOptions(); render(); });
+  selDept.addEventListener('change', ()=>{ state.dept=selDept.value; state.page=0; refreshDropdownOptions(); render(); });
+  selFac.addEventListener('change', ()=>{ state.fac=selFac.value; state.page=0; refreshDropdownOptions(); render(); });
+  selSubj.addEventListener('change', ()=>{ state.subj=selSubj.value; state.page=0; refreshDropdownOptions(); render(); });
   let searchTimer;
   inpSearch.addEventListener('input', ()=>{
     clearTimeout(searchTimer);
@@ -1439,7 +1500,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   document.getElementById('btn-reset').addEventListener('click', ()=>{
     state.year=ALL; state.dept=ALL; state.fac=ALL; state.subj=ALL; state.search=''; state.page=0;
     inpSearch.value='';
-    syncSelectsFromState();
+    refreshDropdownOptions();
     render();
   });
   document.getElementById('fac-toggle').addEventListener('click', ()=>{ state.facExpanded=!state.facExpanded; render(); });
